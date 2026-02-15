@@ -58,6 +58,11 @@ def test_lower_bound() -> None:
     pass
 
 
+@scenario("../backfill.feature", "No lower bound — stop rule halts scanning")
+def test_no_lower_bound() -> None:
+    pass
+
+
 @scenario("../backfill.feature", "Already-uploaded item on IA counts as hit")
 def test_ia_uploaded_counts_as_hit() -> None:
     pass
@@ -78,15 +83,20 @@ def _make_bstate(tribunal: str, streak: int, *, stopped: bool = False) -> Backfi
     return bstate
 
 
+_DEFAULT_LOWER = date(2020, 1, 1)
+_SENTINEL: date = _DEFAULT_LOWER  # only used as a type-compatible default
+
+
 def _make_config(
     *,
-    lower_bound: date | None = None,
+    lower_bound: date | None = _SENTINEL,
     max_items: int = 0,
     dry_run: bool = False,
 ) -> BackfillConfig:
+    resolved = lower_bound if lower_bound is not _SENTINEL else _DEFAULT_LOWER
     return BackfillConfig(
         start_date=BASE_DATE,
-        lower_bound=lower_bound or date(2020, 1, 1),
+        lower_bound=resolved,
         tribunal=None,
         deadline_minutes=45,
         max_items=max_items,
@@ -236,6 +246,50 @@ def when_backfill(
     config = replace(config, max_items=n)
 
     # IA uploads accepted
+    mock_api.put(url__startswith="https://s3.us.archive.org/").respond(200)
+
+    summary = BackfillSummary()
+
+    async def _run() -> None:
+        breaker = CircuitBreaker(threshold=5)
+        import time
+
+        deadline = time.monotonic() + 300
+        async with httpx.AsyncClient() as client:
+            await backfill_tribunal(
+                client,
+                breaker,
+                tribunal,
+                config,
+                bstate,
+                ia_state,
+                deadline,
+                summary,
+            )
+
+    asyncio.run(_run())
+    context["summary"] = summary
+    return context
+
+
+@when(
+    parsers.parse('I backfill "{tribunal}" for {n:d} date with no lower bound'),
+    target_fixture="bf_result",
+)
+@when(
+    parsers.parse('I backfill "{tribunal}" for {n:d} dates with no lower bound'),
+    target_fixture="bf_result",
+)
+def when_backfill_no_lower(
+    tribunal: str,
+    n: int,
+    mock_api: respx.MockRouter,
+    context: dict[str, Any],
+) -> dict[str, Any]:
+    bstate: BackfillState = context["bstate"]
+    ia_state: State = context["ia_state"]
+    config = _make_config(lower_bound=None, max_items=n)
+
     mock_api.put(url__startswith="https://s3.us.archive.org/").respond(200)
 
     summary = BackfillSummary()

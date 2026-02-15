@@ -146,6 +146,24 @@ class BackfillState:
                 return True
             return False
 
+    async def ensure_cursor_at_least(self, tribunal: str, min_date: date) -> bool:
+        """Advance the tribunal's cursor to *min_date* if it is older.
+
+        Also un-stops the tribunal when advanced, since new dates may have
+        publications.  Returns ``True`` if the cursor was changed.
+        """
+        async with self._lock:
+            if tribunal not in self._tribunals:
+                return False
+            prog = self._tribunals[tribunal]
+            if prog.cursor_date < min_date:
+                prog.cursor_date = min_date
+                if prog.stopped:
+                    prog.stopped = False
+                    prog.empty_streak = 0
+                return True
+            return False
+
     def get_all_progress(self) -> dict[str, TribunalProgress]:
         """Return a snapshot of all tribunal progress (not locked — read-only use)."""
         return dict(self._tribunals)
@@ -206,7 +224,7 @@ def save_backfill_state(state: BackfillState, path: Path | None) -> None:
 @dataclass
 class BackfillConfig:
     start_date: date
-    lower_bound: date
+    lower_bound: date | None
     tribunal: str | None
     deadline_minutes: int
     max_items: int
@@ -398,7 +416,7 @@ async def backfill_tribunal(
     await summary.inc_scanned()
     items_processed = 0
 
-    while prog.cursor_date >= config.lower_bound:
+    while config.lower_bound is None or prog.cursor_date >= config.lower_bound:
         # Deadline guard
         if time.monotonic() > deadline - 30:
             log.info("backfill_deadline_reached", tribunal=tribunal)
@@ -471,7 +489,17 @@ async def run_backfill(config: BackfillConfig) -> int:
             validate_tribunal(config.tribunal)
             all_tribunals = [config.tribunal]
 
-        # 2. Process tribunals
+        # 2. Advance stale cursors so new dates are always checked
+        for t in all_tribunals:
+            advanced = await bstate.ensure_cursor_at_least(t, config.start_date)
+            if advanced:
+                log.info(
+                    "cursor_auto_advanced",
+                    tribunal=t,
+                    new_cursor=config.start_date.isoformat(),
+                )
+
+        # 3. Process tribunals
         summary = BackfillSummary()
         breaker = CircuitBreaker(threshold=5, recovery_timeout=60.0)
 
@@ -502,11 +530,11 @@ async def run_backfill(config: BackfillConfig) -> int:
         workers = [asyncio.create_task(_worker()) for _ in range(config.workers)]
         await asyncio.gather(*workers)
 
-    # 3. Save state
+    # 4. Save state
     save_backfill_state(bstate, config.backfill_state_file)
     save_state(ia_state, config.state_file)
 
-    # 4. Summary
+    # 5. Summary
     log.info(
         "backfill_complete",
         tribunals_scanned=summary.tribunals_scanned,
