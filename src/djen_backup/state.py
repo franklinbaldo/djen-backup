@@ -1,0 +1,107 @@
+"""Persistent state cache backed by a JSON file.
+
+Used as a GHA artifact to avoid redundant Internet Archive metadata queries
+across runs.  The IA metadata API remains the authoritative source — this
+cache is purely an optimisation.
+"""
+
+from __future__ import annotations
+
+import json
+from datetime import UTC, date, datetime
+from enum import StrEnum
+from typing import TYPE_CHECKING
+
+import structlog
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+log = structlog.get_logger()
+
+
+class ItemStatus(StrEnum):
+    UPLOADED = "uploaded"
+    ABSENT = "absent"
+
+
+class State:
+    """In-memory state cache with JSON serialisation."""
+
+    def __init__(self) -> None:
+        self._entries: dict[str, dict[str, str]] = {}
+        # _entries layout: {"2024-01-15": {"TJSP": "uploaded", "TJRO": "absent"}}
+
+    # ------------------------------------------------------------------
+    # Query
+    # ------------------------------------------------------------------
+
+    def get_done_tribunals(self, d: date) -> set[str]:
+        """Return tribunal codes known to be uploaded or absent for *d*."""
+        return set(self._entries.get(d.isoformat(), {}).keys())
+
+    def is_done(self, d: date, tribunal: str) -> bool:
+        return tribunal in self._entries.get(d.isoformat(), {})
+
+    # ------------------------------------------------------------------
+    # Mutation
+    # ------------------------------------------------------------------
+
+    def mark(self, d: date, tribunal: str, status: ItemStatus) -> None:
+        key = d.isoformat()
+        if key not in self._entries:
+            self._entries[key] = {}
+        self._entries[key][tribunal] = status.value
+
+    # ------------------------------------------------------------------
+    # Serialisation
+    # ------------------------------------------------------------------
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "version": 1,
+            "updated_at": datetime.now(tz=UTC).isoformat(),
+            "entries": self._entries,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, object]) -> State:
+        state = cls()
+        entries = data.get("entries")
+        if isinstance(entries, dict):
+            for date_key, tribunals in entries.items():
+                if isinstance(date_key, str) and isinstance(tribunals, dict):
+                    state._entries[date_key] = {
+                        k: v
+                        for k, v in tribunals.items()
+                        if isinstance(k, str) and isinstance(v, str)
+                    }
+        return state
+
+
+def load_state(path: Path | None) -> State:
+    """Load state from *path*, returning an empty state on any error."""
+    if path is None or not path.is_file():
+        log.info("state_cache_miss", path=str(path))
+        return State()
+    try:
+        raw: dict[str, object] = json.loads(path.read_text(encoding="utf-8"))
+        state = State.from_dict(raw)
+        log.info(
+            "state_cache_loaded",
+            path=str(path),
+            dates=len(state._entries),
+        )
+        return state
+    except (json.JSONDecodeError, OSError) as exc:
+        log.warning("state_cache_corrupt", path=str(path), error=str(exc))
+        return State()
+
+
+def save_state(state: State, path: Path | None) -> None:
+    """Persist *state* to *path*.  No-op when *path* is ``None``."""
+    if path is None:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(state.to_dict(), indent=2) + "\n", encoding="utf-8")
+    log.info("state_cache_saved", path=str(path))
