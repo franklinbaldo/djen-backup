@@ -152,10 +152,9 @@ def when_process_item(
     async def _run() -> None:
         summary = Summary(total=1)
         breaker = CircuitBreaker(threshold=5)
-        sem = asyncio.Semaphore(1)
         deadline = time.monotonic() + 300
         async with httpx.AsyncClient() as client:
-            await _process_item(client, sem, breaker, item, state, config, deadline, summary)
+            await _process_item(client, breaker, item, state, config, deadline, summary)
         context["summary"] = summary
 
     asyncio.run(_run())
@@ -219,11 +218,14 @@ def then_state_mark(state: State, tribunal: str, date_str: str, status: str) -> 
 
 @then("the upload Content-MD5 should match the file's MD5 hash")
 def then_md5_matches(context: dict[str, Any]) -> None:
+    import base64
+
     ia_requests: list[httpx.Request] = context["ia_requests"]
     assert ia_requests
     req = ia_requests[0]
     actual_md5 = req.headers.get("content-md5")
-    expected_md5 = hashlib.md5(context["zip_content"]).hexdigest()
+    digest = hashlib.md5(context["zip_content"], usedforsecurity=False).digest()
+    expected_md5 = base64.b64encode(digest).decode("ascii")
     assert actual_md5 == expected_md5, f"MD5 mismatch: {actual_md5} != {expected_md5}"
 
 

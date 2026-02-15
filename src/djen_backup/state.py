@@ -43,6 +43,11 @@ class State:
     def is_done(self, d: date, tribunal: str) -> bool:
         return tribunal in self._entries.get(d.isoformat(), {})
 
+    @property
+    def date_count(self) -> int:
+        """Number of dates tracked in the cache."""
+        return len(self._entries)
+
     # ------------------------------------------------------------------
     # Mutation
     # ------------------------------------------------------------------
@@ -90,7 +95,7 @@ def load_state(path: Path | None) -> State:
         log.info(
             "state_cache_loaded",
             path=str(path),
-            dates=len(state._entries),
+            dates=state.date_count,
         )
         return state
     except (json.JSONDecodeError, OSError) as exc:

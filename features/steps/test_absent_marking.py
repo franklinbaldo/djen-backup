@@ -116,10 +116,9 @@ def when_process_item(
     async def _run() -> None:
         summary = Summary(total=1)
         breaker = CircuitBreaker(threshold=5)
-        sem = asyncio.Semaphore(1)
         deadline = time.monotonic() + 300
         async with httpx.AsyncClient() as client:
-            await _process_item(client, sem, breaker, item, state, config, deadline, summary)
+            await _process_item(client, breaker, item, state, config, deadline, summary)
         context["summary"] = summary
 
     asyncio.run(_run())

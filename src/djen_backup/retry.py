@@ -56,6 +56,9 @@ async def request_with_retry(
                     continue
                 return resp
 
+            # The DJEN proxy occasionally returns HTTP 400 for valid
+            # requests under transient load — treat as retriable when the
+            # caller opts in via retry_djen_400=True.
             if retry_djen_400 and resp.status_code == 400:
                 wait = _backoff(attempt, resp)
                 if attempt < max_retries:

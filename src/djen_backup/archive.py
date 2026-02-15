@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import time
 from datetime import UTC, date, datetime
@@ -64,18 +65,20 @@ async def fetch_ia_existing(
 IA_S3_URL = "https://s3.us.archive.org/djen-{date}/{filename}"
 
 
-def _md5_hex(data: bytes) -> str:
-    return hashlib.md5(data).hexdigest()
+def _content_md5(data: bytes) -> str:
+    """Return base64-encoded MD5 digest per the S3 Content-MD5 spec."""
+    digest = hashlib.md5(data, usedforsecurity=False).digest()
+    return base64.b64encode(digest).decode("ascii")
 
 
 def _build_upload_headers(
     d: date,
-    md5_hex: str,
+    content_md5: str,
     auth: str,
 ) -> dict[str, str]:
     return {
         "Authorization": auth,
-        "Content-MD5": md5_hex,
+        "Content-MD5": content_md5,
         "x-archive-auto-make-bucket": "1",
         "x-archive-queue-derive": "0",
         "x-archive-meta-collection": "opensource",
@@ -100,7 +103,7 @@ async def upload_zip(
     """Upload a ZIP to IA S3."""
     filename = f"djen-{d.isoformat()}-{tribunal}.zip"
     url = IA_S3_URL.format(date=d.isoformat(), filename=filename)
-    md5 = _md5_hex(content)
+    md5 = _content_md5(content)
     headers = _build_upload_headers(d, md5, auth)
 
     log.info("ia_upload_start", date=d.isoformat(), tribunal=tribunal, size=len(content))
@@ -142,7 +145,7 @@ async def upload_absent_marker(
         }
     ).encode()
 
-    md5 = _md5_hex(body)
+    md5 = _content_md5(body)
     headers = _build_upload_headers(d, md5, auth)
 
     log.info("ia_absent_marker", date=d.isoformat(), tribunal=tribunal)

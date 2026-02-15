@@ -98,7 +98,6 @@ def when_process_with_deadline(
     async def _run() -> Summary:
         summary = Summary(total=queue_size)
         breaker = CircuitBreaker(threshold=5)
-        sem = asyncio.Semaphore(1)
         deadline = time.monotonic() + deadline_seconds
 
         async with httpx.AsyncClient() as client:
@@ -106,7 +105,7 @@ def when_process_with_deadline(
                 if seconds > 0:
                     # Simulate time passing by moving the deadline closer
                     deadline -= seconds
-                await _process_item(client, sem, breaker, item, state, config, deadline, summary)
+                await _process_item(client, breaker, item, state, config, deadline, summary)
 
         return summary
 

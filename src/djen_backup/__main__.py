@@ -29,6 +29,8 @@ structlog.configure(
     cache_logger_on_first_use=True,
 )
 
+# Stable Cloud Run URL for the DJEN proxy service.
+# Override via the DJEN_PROXY_URL environment variable if redeployed.
 DEFAULT_PROXY_URL = "https://djen-proxy-mhgmawcn3a-rj.a.run.app"
 
 

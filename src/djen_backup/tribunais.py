@@ -5,6 +5,8 @@ from __future__ import annotations
 import httpx
 import structlog
 
+from djen_backup.retry import request_with_retry
+
 log = structlog.get_logger()
 
 TRIBUNAIS: list[str] = [
@@ -114,7 +116,7 @@ async def fetch_tribunal_list_from_api(
     """Fetch tribunal codes from the DJEN proxy API."""
     url = f"{base_url}/api/v1/comunicacao/tribunal"
     try:
-        resp = await client.get(url, timeout=15.0)
+        resp = await request_with_retry(client, "GET", url)
         resp.raise_for_status()
         raw = resp.json()
         if not isinstance(raw, list):

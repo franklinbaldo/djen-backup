@@ -163,7 +163,6 @@ async def discover_gaps(
 
 async def _process_item(
     client: httpx.AsyncClient,
-    semaphore: asyncio.Semaphore,
     breaker: CircuitBreaker,
     item: WorkItem,
     state: State,
@@ -171,102 +170,101 @@ async def _process_item(
     deadline: float,
     summary: Summary,
 ) -> None:
-    async with semaphore:
-        # Deadline guard
-        if time.monotonic() > deadline - 30:
-            log.info(
-                "skipped_deadline",
-                date=item.date.isoformat(),
-                tribunal=item.tribunal,
-            )
-            await summary.inc_skipped_deadline()
-            return
+    # Deadline guard
+    if time.monotonic() > deadline - 30:
+        log.info(
+            "skipped_deadline",
+            date=item.date.isoformat(),
+            tribunal=item.tribunal,
+        )
+        await summary.inc_skipped_deadline()
+        return
 
-        # Circuit breaker guard
-        if not await breaker.allow_request():
-            log.info(
-                "skipped_circuit_breaker",
-                date=item.date.isoformat(),
-                tribunal=item.tribunal,
-            )
-            await summary.inc_skipped_circuit()
-            return
+    # Circuit breaker guard
+    if not await breaker.allow_request():
+        log.info(
+            "skipped_circuit_breaker",
+            date=item.date.isoformat(),
+            tribunal=item.tribunal,
+        )
+        await summary.inc_skipped_circuit()
+        return
 
-        if config.dry_run:
-            log.info(
-                "dry_run_skip",
-                date=item.date.isoformat(),
-                tribunal=item.tribunal,
-            )
-            await summary.inc_uploaded()
-            return
+    if config.dry_run:
+        log.info(
+            "dry_run_skip",
+            date=item.date.isoformat(),
+            tribunal=item.tribunal,
+        )
+        await summary.inc_uploaded()
+        return
 
+    try:
+        zip_url = await get_caderno_url(client, config.djen_proxy_url, item.tribunal, item.date)
+        content = await download_zip(client, zip_url)
+    except DJENNotFound as exc:
+        # DJEN doesn't have it — mark absent
+        log.info(
+            "djen_not_found",
+            date=item.date.isoformat(),
+            tribunal=item.tribunal,
+            status_code=exc.status_code,
+        )
         try:
-            zip_url = await get_caderno_url(client, config.djen_proxy_url, item.tribunal, item.date)
-            content = await download_zip(client, zip_url)
-        except DJENNotFound as exc:
-            # DJEN doesn't have it — mark absent
-            log.info(
-                "djen_not_found",
-                date=item.date.isoformat(),
-                tribunal=item.tribunal,
-                status_code=exc.status_code,
+            resp = await upload_absent_marker(
+                client,
+                item.date,
+                item.tribunal,
+                exc.status_code,
+                exc.reason,
+                config.ia_auth,
             )
-            try:
-                resp = await upload_absent_marker(
-                    client,
-                    item.date,
-                    item.tribunal,
-                    exc.status_code,
-                    exc.reason,
-                    config.ia_auth,
-                )
-                if resp.status_code < 400:
-                    await breaker.record_success()
-                    state.mark(item.date, item.tribunal, ItemStatus.ABSENT)
-                    await summary.inc_absent()
-                else:
-                    await breaker.record_failure()
-                    await summary.inc_failed()
-            except httpx.HTTPError:
-                await breaker.record_failure()
-                await summary.inc_failed()
-            return
-        except httpx.HTTPError as exc:
-            log.error(
-                "djen_download_error",
-                date=item.date.isoformat(),
-                tribunal=item.tribunal,
-                error=str(exc),
-            )
-            await summary.inc_failed()
-            return
-
-        # Upload to IA
-        try:
-            resp = await upload_zip(client, item.date, item.tribunal, content, config.ia_auth)
             if resp.status_code < 400:
                 await breaker.record_success()
-                state.mark(item.date, item.tribunal, ItemStatus.UPLOADED)
-                await summary.inc_uploaded()
+                state.mark(item.date, item.tribunal, ItemStatus.ABSENT)
+                await summary.inc_absent()
             else:
-                log.error(
-                    "ia_upload_failed",
-                    date=item.date.isoformat(),
-                    tribunal=item.tribunal,
-                    status=resp.status_code,
-                )
                 await breaker.record_failure()
                 await summary.inc_failed()
-        except httpx.HTTPError as exc:
+        except httpx.HTTPError:
+            await breaker.record_failure()
+            await summary.inc_failed()
+        return
+    except httpx.HTTPError as exc:
+        log.error(
+            "djen_download_error",
+            date=item.date.isoformat(),
+            tribunal=item.tribunal,
+            error=str(exc),
+        )
+        await summary.inc_failed()
+        return
+
+    # Upload to IA
+    try:
+        resp = await upload_zip(client, item.date, item.tribunal, content, config.ia_auth)
+        if resp.status_code < 400:
+            await breaker.record_success()
+            state.mark(item.date, item.tribunal, ItemStatus.UPLOADED)
+            await summary.inc_uploaded()
+        else:
             log.error(
-                "ia_upload_error",
+                "ia_upload_failed",
                 date=item.date.isoformat(),
                 tribunal=item.tribunal,
-                error=str(exc),
+                status=resp.status_code,
             )
             await breaker.record_failure()
             await summary.inc_failed()
+    except httpx.HTTPError as exc:
+        log.error(
+            "ia_upload_error",
+            date=item.date.isoformat(),
+            tribunal=item.tribunal,
+            error=str(exc),
+        )
+        await breaker.record_failure()
+        await summary.inc_failed()
 
 
 # ── Main orchestration ───────────────────────────────────────────────
@@ -318,19 +316,24 @@ async def run(config: RunConfig) -> int:
 
         log.info("work_queue_built", total=len(work_queue))
 
-        # 3. Process
+        # 3. Process — bounded worker pool via asyncio.Queue
         summary = Summary(total=len(work_queue))
-        sem = asyncio.Semaphore(config.workers)
         breaker = CircuitBreaker(threshold=5, recovery_timeout=60.0)
-
-        tasks: list[asyncio.Task[None]] = []
+        queue: asyncio.Queue[WorkItem] = asyncio.Queue()
         for item in work_queue:
-            task = asyncio.create_task(
-                _process_item(client, sem, breaker, item, state, config, deadline, summary)
-            )
-            tasks.append(task)
+            queue.put_nowait(item)
 
-        await asyncio.gather(*tasks)
+        async def _worker() -> None:
+            while not queue.empty():
+                try:
+                    item = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                await _process_item(client, breaker, item, state, config, deadline, summary)
+                queue.task_done()
+
+        workers = [asyncio.create_task(_worker()) for _ in range(config.workers)]
+        await asyncio.gather(*workers)
 
     # 4. Save state
     save_state(state, config.state_file)
