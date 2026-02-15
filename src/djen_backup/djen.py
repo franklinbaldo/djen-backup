@@ -41,8 +41,9 @@ async def get_caderno_url(
     if resp.status_code == 404:
         raise DJENNotFound(status_code=404, reason="Not Found")
 
-    if resp.status_code != 200:
-        raise DJENNotFound(status_code=resp.status_code, reason=resp.reason_phrase)
+    # Transient server errors (5xx, etc.) should propagate as HTTPStatusError
+    # so the caller retries rather than permanently marking absent.
+    resp.raise_for_status()
 
     try:
         data: dict[str, object] = resp.json()

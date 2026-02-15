@@ -202,7 +202,10 @@ class CircuitBreaker:
             if s == CircuitState.CLOSED:
                 return True
             if s == CircuitState.HALF_OPEN:
-                self._state = CircuitState.HALF_OPEN
+                # Consume the probe slot — transition to OPEN so only one
+                # worker gets through while the test request is in-flight.
+                self._state = CircuitState.OPEN
+                self._opened_at = time.monotonic()
                 return True
             return False
 

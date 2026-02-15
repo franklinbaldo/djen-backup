@@ -116,9 +116,15 @@ async def fetch_tribunal_list_from_api(
     try:
         resp = await client.get(url, timeout=15.0)
         resp.raise_for_status()
-        data: list[dict[str, object]] = resp.json()
+        raw = resp.json()
+        if not isinstance(raw, list):
+            log.warning("tribunal_api_unexpected_payload", type=type(raw).__name__)
+            return []
+        data: list[object] = raw
         codes: list[str] = []
         for group in data:
+            if not isinstance(group, dict):
+                continue
             instituicoes = group.get("instituicoes", [])
             if isinstance(instituicoes, list):
                 for inst in instituicoes:
