@@ -44,6 +44,14 @@ Feature: Backfill with 60-empty-day stop rule
     Then "TJLB" should not be stopped
     And the backfill summary should show 0 dates processed
 
+  Scenario: No lower bound — stop rule halts scanning
+    Given a tribunal "TJNB" with 59 consecutive empties
+    And DJEN proxy returns 404 for the next date
+    And Internet Archive accepts uploads
+    When I backfill "TJNB" for 1 date with no lower bound
+    Then "TJNB" should be stopped
+    And the empty streak should be 60
+
   Scenario: Already-uploaded item on IA counts as hit
     Given a tribunal "TJIA" with 59 consecutive empties
     And IA state marks the next date as "uploaded"
