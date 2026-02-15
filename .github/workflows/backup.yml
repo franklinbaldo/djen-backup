@@ -41,7 +41,7 @@ jobs:
           [ -n "$START_DATE" ] && args="$args --start-date $START_DATE"
           [ -n "$END_DATE" ] && args="$args --end-date $END_DATE"
           [ -n "$TRIBUNAL" ] && args="$args --tribunal $TRIBUNAL"
-          uv run djen-backup $args --deadline-minutes 45 --state-file .cache/state.json
+          uv run djen-backup scan $args --deadline-minutes 45 --state-file .cache/state.json
         env:
           START_DATE: ${{ inputs.start_date }}
           END_DATE: ${{ inputs.end_date }}

@@ -53,6 +53,10 @@ class State:
     def is_done(self, d: date, tribunal: str) -> bool:
         return tribunal in self._entries.get(d.isoformat(), {})
 
+    def get_status(self, d: date, tribunal: str) -> str | None:
+        """Return the status string (``"uploaded"``/``"absent"``) or ``None``."""
+        return self._entries.get(d.isoformat(), {}).get(tribunal)
+
     @property
     def date_count(self) -> int:
         """Number of dates tracked in the cache."""
