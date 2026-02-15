@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import re
+import tempfile
 import time
 from dataclasses import dataclass, field
 from datetime import date, timedelta
-from typing import TYPE_CHECKING
+from pathlib import Path
 
 import httpx
 import structlog
@@ -21,10 +23,20 @@ from djen_backup.djen import DJENNotFound, download_zip, get_caderno_url
 from djen_backup.state import ItemStatus, State, load_state, save_state
 from djen_backup.tribunais import get_tribunal_list
 
-if TYPE_CHECKING:
-    from pathlib import Path
-
 log = structlog.get_logger()
+
+_TRIBUNAL_RE = re.compile(r"^[A-Za-z0-9-]+$")
+
+
+def validate_tribunal(code: str) -> str:
+    """Validate a tribunal code against an allowlist pattern.
+
+    Raises ``ValueError`` if the code contains unsafe characters.
+    """
+    if not _TRIBUNAL_RE.fullmatch(code):
+        msg = f"Invalid tribunal code: {code!r} (must match {_TRIBUNAL_RE.pattern})"
+        raise ValueError(msg)
+    return code
 
 
 # ── Data types ───────────────────────────────────────────────────────
@@ -86,10 +98,15 @@ class Summary:
         return self.uploaded + self.absent_marked
 
     @property
+    def attempted(self) -> int:
+        """Items that were actually attempted (excludes skipped)."""
+        return self.processed + self.failed
+
+    @property
     def success_rate(self) -> float:
-        if self.total == 0:
+        if self.attempted == 0:
             return 1.0
-        return self.processed / self.total
+        return self.processed / self.attempted
 
 
 # ── Gap discovery ────────────────────────────────────────────────────
@@ -116,7 +133,7 @@ async def _check_date(
     """Return work items for tribunals missing on *d*."""
     # Fast path: state says everything is done
     if not force_recheck:
-        cached = state.get_done_tribunals(d)
+        cached = await state.get_done_tribunals(d)
         remaining = tribunals - cached
         if not remaining:
             return []
@@ -128,9 +145,9 @@ async def _check_date(
     # Merge IA data into state
     for tribunal, status_str in ia_existing.items():
         status = ItemStatus.UPLOADED if status_str == "uploaded" else ItemStatus.ABSENT
-        state.mark(d, tribunal, status)
+        await state.mark(d, tribunal, status)
 
-    all_done = state.get_done_tribunals(d) if not force_recheck else set(ia_existing.keys())
+    all_done = await state.get_done_tribunals(d) if not force_recheck else set(ia_existing.keys())
     gaps = tribunals - all_done
     return [WorkItem(date=d, tribunal=t) for t in sorted(gaps)]
 
@@ -161,7 +178,7 @@ async def discover_gaps(
 # ── Item processing ──────────────────────────────────────────────────
 
 
-async def _process_item(
+async def process_item(
     client: httpx.AsyncClient,
     breaker: CircuitBreaker,
     item: WorkItem,
@@ -170,6 +187,11 @@ async def _process_item(
     deadline: float,
     summary: Summary,
 ) -> None:
+    """Process a single (date, tribunal) work item.
+
+    Downloads the ZIP from DJEN to a temporary file, then uploads it to IA.
+    The temp file is cleaned up after processing regardless of outcome.
+    """
     # Deadline guard
     if time.monotonic() > deadline - 30:
         log.info(
@@ -199,9 +221,10 @@ async def _process_item(
         await summary.inc_uploaded()
         return
 
+    zip_path: Path | None = None
     try:
         zip_url = await get_caderno_url(client, config.djen_proxy_url, item.tribunal, item.date)
-        content = await download_zip(client, zip_url)
+        zip_path = await download_zip(client, zip_url)
     except DJENNotFound as exc:
         # DJEN doesn't have it — mark absent
         log.info(
@@ -221,7 +244,7 @@ async def _process_item(
             )
             if resp.status_code < 400:
                 await breaker.record_success()
-                state.mark(item.date, item.tribunal, ItemStatus.ABSENT)
+                await state.mark(item.date, item.tribunal, ItemStatus.ABSENT)
                 await summary.inc_absent()
             else:
                 await breaker.record_failure()
@@ -240,12 +263,12 @@ async def _process_item(
         await summary.inc_failed()
         return
 
-    # Upload to IA
+    # Upload to IA from the temp file
     try:
-        resp = await upload_zip(client, item.date, item.tribunal, content, config.ia_auth)
+        resp = await upload_zip(client, item.date, item.tribunal, zip_path, config.ia_auth)
         if resp.status_code < 400:
             await breaker.record_success()
-            state.mark(item.date, item.tribunal, ItemStatus.UPLOADED)
+            await state.mark(item.date, item.tribunal, ItemStatus.UPLOADED)
             await summary.inc_uploaded()
         else:
             log.error(
@@ -265,6 +288,9 @@ async def _process_item(
         )
         await breaker.record_failure()
         await summary.inc_failed()
+    finally:
+        if zip_path is not None:
+            zip_path.unlink(missing_ok=True)
 
 
 # ── Main orchestration ───────────────────────────────────────────────
@@ -280,6 +306,7 @@ async def run(config: RunConfig) -> int:
         # 1. Tribunal list
         all_tribunals = await get_tribunal_list(client, config.djen_proxy_url)
         if config.tribunal:
+            validate_tribunal(config.tribunal)
             if config.tribunal in all_tribunals:
                 all_tribunals = [config.tribunal]
             else:
@@ -323,17 +350,26 @@ async def run(config: RunConfig) -> int:
         for item in work_queue:
             queue.put_nowait(item)
 
+        # Use a temporary directory for ZIP downloads in this run
+        tmp_dir = Path(tempfile.mkdtemp(prefix="djen-"))
+
         async def _worker() -> None:
             while not queue.empty():
                 try:
                     item = queue.get_nowait()
                 except asyncio.QueueEmpty:
                     break
-                await _process_item(client, breaker, item, state, config, deadline, summary)
+                await process_item(client, breaker, item, state, config, deadline, summary)
                 queue.task_done()
 
         workers = [asyncio.create_task(_worker()) for _ in range(config.workers)]
-        await asyncio.gather(*workers)
+        try:
+            await asyncio.gather(*workers)
+        finally:
+            # Clean up the temp directory
+            import shutil
+
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
     # 4. Save state
     save_state(state, config.state_file)

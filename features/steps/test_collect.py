@@ -2,24 +2,16 @@
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
-import time
-from datetime import date
 from typing import TYPE_CHECKING, Any
 
-import httpx
-from pytest_bdd import given, parsers, scenario, then, when
+from pytest_bdd import given, parsers, scenario, then
 
-from djen_backup.archive import CircuitBreaker
-from djen_backup.runner import RunConfig, Summary, WorkItem, _process_item
-
-from .conftest import parse_table
+from .conftest import FAKE_AUTH
 
 if TYPE_CHECKING:
+    import httpx
     import respx
-
-    from djen_backup.state import State
 
 # ── Scenarios ────────────────────────────────────────────────────────
 
@@ -40,8 +32,6 @@ def test_idempotent() -> None:
 
 
 # ── Helpers ──────────────────────────────────────────────────────────
-
-FAKE_AUTH = "LOW test-access:test-secret"
 
 
 def _make_zip(size: int) -> bytes:
@@ -83,106 +73,6 @@ def given_zip_download(
     mock_api.get(context["download_url"]).respond(200, content=content)
 
 
-@given("Internet Archive accepts uploads")
-def given_ia_accepts(mock_api: respx.MockRouter, context: dict[str, Any]) -> None:
-    context["ia_requests"] = []
-
-    def _capture(request: httpx.Request) -> httpx.Response:
-        context["ia_requests"].append(request)
-        return httpx.Response(200)
-
-    mock_api.put(url__startswith="https://s3.us.archive.org/").mock(side_effect=_capture)
-
-
-@given(
-    parsers.parse('Internet Archive has files for "{date_str}":'),
-    target_fixture="ia_date_str",
-)
-def given_ia_files(
-    mock_api: respx.MockRouter,
-    date_str: str,
-    datatable: list[list[str]],
-) -> str:
-    rows = parse_table(datatable)
-    filenames = [row["filename"] for row in rows]
-    payload = {"files": [{"name": fn} for fn in filenames]}
-    mock_api.get(f"https://archive.org/metadata/djen-{date_str}").respond(200, json=payload)
-    return date_str
-
-
-@given(
-    "the tribunal list is:",
-    target_fixture="tribunal_list",
-)
-def given_tribunal_list(datatable: list[list[str]]) -> list[str]:
-    rows = parse_table(datatable)
-    return [row["tribunal"] for row in rows]
-
-
-# ── When ─────────────────────────────────────────────────────────────
-
-
-@when(
-    parsers.parse('I process the item "{tribunal}" on "{date_str}"'),
-    target_fixture="process_result",
-)
-def when_process_item(
-    state: State,
-    mock_api: respx.MockRouter,
-    tribunal: str,
-    date_str: str,
-    context: dict[str, Any],
-) -> dict[str, Any]:
-    d = date.fromisoformat(date_str)
-    item = WorkItem(date=d, tribunal=tribunal)
-    config = RunConfig(
-        start_date=d,
-        end_date=d,
-        tribunal=tribunal,
-        deadline_minutes=45,
-        max_items=0,
-        workers=1,
-        state_file=None,
-        djen_proxy_url="https://djen-proxy.test",
-        ia_auth=FAKE_AUTH,
-        dry_run=False,
-        force_recheck=False,
-    )
-
-    async def _run() -> None:
-        summary = Summary(total=1)
-        breaker = CircuitBreaker(threshold=5)
-        deadline = time.monotonic() + 300
-        async with httpx.AsyncClient() as client:
-            await _process_item(client, breaker, item, state, config, deadline, summary)
-        context["summary"] = summary
-
-    asyncio.run(_run())
-    context["state"] = state
-    context["date"] = d
-    return context
-
-
-@when(
-    parsers.parse('I detect gaps for "{date_str}"'),
-    target_fixture="gaps",
-)
-def when_detect_gaps(
-    state: State,
-    tribunal_list: list[str],
-    date_str: str,
-) -> list[WorkItem]:
-    from djen_backup.runner import discover_gaps
-
-    d = date.fromisoformat(date_str)
-
-    async def _run() -> list[WorkItem]:
-        async with httpx.AsyncClient() as client:
-            return await discover_gaps(client, state, tribunal_list, d, d, force_recheck=False)
-
-    return asyncio.run(_run())
-
-
 # ── Then ─────────────────────────────────────────────────────────────
 
 
@@ -208,14 +98,6 @@ def then_ia_headers(context: dict[str, Any]) -> None:
     assert req.headers["x-archive-queue-derive"] == "0"
 
 
-@then(
-    parsers.parse('the state should mark "{tribunal}" on "{date_str}" as "{status}"'),
-)
-def then_state_mark(state: State, tribunal: str, date_str: str, status: str) -> None:
-    d = date.fromisoformat(date_str)
-    assert state.is_done(d, tribunal), f"{tribunal} on {date_str} not marked in state"
-
-
 @then("the upload Content-MD5 should match the file's MD5 hash")
 def then_md5_matches(context: dict[str, Any]) -> None:
     import base64
@@ -227,8 +109,3 @@ def then_md5_matches(context: dict[str, Any]) -> None:
     digest = hashlib.md5(context["zip_content"], usedforsecurity=False).digest()
     expected_md5 = base64.b64encode(digest).decode("ascii")
     assert actual_md5 == expected_md5, f"MD5 mismatch: {actual_md5} != {expected_md5}"
-
-
-@then("there should be no gaps")
-def then_no_gaps(gaps: list[WorkItem]) -> None:
-    assert len(gaps) == 0, f"Expected no gaps, got {gaps}"

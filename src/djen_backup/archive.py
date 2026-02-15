@@ -15,6 +15,8 @@ import structlog
 from djen_backup.retry import request_with_retry
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     import httpx
 
 log = structlog.get_logger()
@@ -74,11 +76,13 @@ def _content_md5(data: bytes) -> str:
 def _build_upload_headers(
     d: date,
     content_md5: str,
+    content_type: str,
     auth: str,
 ) -> dict[str, str]:
     return {
         "Authorization": auth,
         "Content-MD5": content_md5,
+        "Content-Type": content_type,
         "x-archive-auto-make-bucket": "1",
         "x-archive-queue-derive": "0",
         "x-archive-meta-collection": "opensource",
@@ -97,14 +101,18 @@ async def upload_zip(
     client: httpx.AsyncClient,
     d: date,
     tribunal: str,
-    content: bytes,
+    zip_path: Path,
     auth: str,
 ) -> httpx.Response:
-    """Upload a ZIP to IA S3."""
+    """Upload a ZIP file to IA S3.
+
+    Reads *zip_path* into memory for the upload.
+    """
+    content = zip_path.read_bytes()
     filename = f"djen-{d.isoformat()}-{tribunal}.zip"
     url = IA_S3_URL.format(date=d.isoformat(), filename=filename)
     md5 = _content_md5(content)
-    headers = _build_upload_headers(d, md5, auth)
+    headers = _build_upload_headers(d, md5, "application/zip", auth)
 
     log.info("ia_upload_start", date=d.isoformat(), tribunal=tribunal, size=len(content))
     resp = await request_with_retry(
@@ -146,7 +154,7 @@ async def upload_absent_marker(
     ).encode()
 
     md5 = _content_md5(body)
-    headers = _build_upload_headers(d, md5, auth)
+    headers = _build_upload_headers(d, md5, "application/json", auth)
 
     log.info("ia_absent_marker", date=d.isoformat(), tribunal=tribunal)
     resp = await request_with_retry(
@@ -192,6 +200,16 @@ class CircuitBreaker:
 
     @property
     def state(self) -> CircuitState:
+        """Return the current state (for external inspection / tests)."""
+        if (
+            self._state == CircuitState.OPEN
+            and time.monotonic() - self._opened_at >= self._recovery_timeout
+        ):
+            return CircuitState.HALF_OPEN
+        return self._state
+
+    def _state_locked(self) -> CircuitState:
+        """Compute state while the lock is held (avoids TOCTOU)."""
         if (
             self._state == CircuitState.OPEN
             and time.monotonic() - self._opened_at >= self._recovery_timeout
@@ -201,7 +219,7 @@ class CircuitBreaker:
 
     async def allow_request(self) -> bool:
         async with self._lock:
-            s = self.state
+            s = self._state_locked()
             if s == CircuitState.CLOSED:
                 return True
             if s == CircuitState.HALF_OPEN:
@@ -221,7 +239,7 @@ class CircuitBreaker:
     async def record_failure(self) -> None:
         async with self._lock:
             self._failure_count += 1
-            if self._state == CircuitState.HALF_OPEN:
+            if self._state_locked() == CircuitState.HALF_OPEN:
                 # Test request failed — reopen with increased timeout
                 self._recovery_timeout = min(self._recovery_timeout * 2, 300.0)
                 self._state = CircuitState.OPEN

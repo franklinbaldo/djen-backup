@@ -11,14 +11,14 @@ import httpx
 from pytest_bdd import given, parsers, scenario, then, when
 
 from djen_backup.archive import CircuitBreaker
-from djen_backup.runner import RunConfig, Summary, WorkItem, _process_item
+from djen_backup.runner import RunConfig, Summary, WorkItem, process_item
+
+from .conftest import FAKE_AUTH
 
 if TYPE_CHECKING:
     import respx
 
     from djen_backup.state import State
-
-FAKE_AUTH = "LOW test-access:test-secret"
 
 
 # ── Scenarios ────────────────────────────────────────────────────────
@@ -105,7 +105,7 @@ def when_process_with_deadline(
                 if seconds > 0:
                     # Simulate time passing by moving the deadline closer
                     deadline -= seconds
-                await _process_item(client, breaker, item, state, config, deadline, summary)
+                await process_item(client, breaker, item, state, config, deadline, summary)
 
         return summary
 

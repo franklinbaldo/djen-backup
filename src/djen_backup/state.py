@@ -7,8 +7,9 @@ cache is purely an optimisation.
 
 from __future__ import annotations
 
+import asyncio
 import json
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
 from typing import TYPE_CHECKING
 
@@ -19,6 +20,9 @@ if TYPE_CHECKING:
 
 log = structlog.get_logger()
 
+# Entries older than this are pruned on save to prevent unbounded growth.
+_TTL_DAYS = 90
+
 
 class ItemStatus(StrEnum):
     UPLOADED = "uploaded"
@@ -26,19 +30,25 @@ class ItemStatus(StrEnum):
 
 
 class State:
-    """In-memory state cache with JSON serialisation."""
+    """In-memory state cache with JSON serialisation.
+
+    All mutation methods are protected by an asyncio.Lock so concurrent
+    coroutines cannot interleave reads and writes.
+    """
 
     def __init__(self) -> None:
         self._entries: dict[str, dict[str, str]] = {}
         # _entries layout: {"2024-01-15": {"TJSP": "uploaded", "TJRO": "absent"}}
+        self._lock = asyncio.Lock()
 
     # ------------------------------------------------------------------
     # Query
     # ------------------------------------------------------------------
 
-    def get_done_tribunals(self, d: date) -> set[str]:
+    async def get_done_tribunals(self, d: date) -> set[str]:
         """Return tribunal codes known to be uploaded or absent for *d*."""
-        return set(self._entries.get(d.isoformat(), {}).keys())
+        async with self._lock:
+            return set(self._entries.get(d.isoformat(), {}).keys())
 
     def is_done(self, d: date, tribunal: str) -> bool:
         return tribunal in self._entries.get(d.isoformat(), {})
@@ -52,11 +62,24 @@ class State:
     # Mutation
     # ------------------------------------------------------------------
 
-    def mark(self, d: date, tribunal: str, status: ItemStatus) -> None:
-        key = d.isoformat()
-        if key not in self._entries:
-            self._entries[key] = {}
-        self._entries[key][tribunal] = status.value
+    async def mark(self, d: date, tribunal: str, status: ItemStatus) -> None:
+        async with self._lock:
+            key = d.isoformat()
+            if key not in self._entries:
+                self._entries[key] = {}
+            self._entries[key][tribunal] = status.value
+
+    # ------------------------------------------------------------------
+    # TTL pruning
+    # ------------------------------------------------------------------
+
+    def prune(self, *, ttl_days: int = _TTL_DAYS) -> int:
+        """Remove entries older than *ttl_days*.  Returns the number pruned."""
+        cutoff = (date.today() - timedelta(days=ttl_days)).isoformat()
+        old_keys = [k for k in self._entries if k < cutoff]
+        for k in old_keys:
+            del self._entries[k]
+        return len(old_keys)
 
     # ------------------------------------------------------------------
     # Serialisation
@@ -107,6 +130,9 @@ def save_state(state: State, path: Path | None) -> None:
     """Persist *state* to *path*.  No-op when *path* is ``None``."""
     if path is None:
         return
+    pruned = state.prune()
+    if pruned:
+        log.info("state_cache_pruned", removed=pruned)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(state.to_dict(), indent=2) + "\n", encoding="utf-8")
     log.info("state_cache_saved", path=str(path))

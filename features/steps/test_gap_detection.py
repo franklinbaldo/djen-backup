@@ -6,16 +6,16 @@ import asyncio
 from datetime import date
 from typing import TYPE_CHECKING
 
-import httpx
-from pytest_bdd import given, parsers, scenario, then, when
+from pytest_bdd import given, parsers, scenario, then
 
-from djen_backup.runner import WorkItem, discover_gaps
 from djen_backup.state import ItemStatus, State
 
 from .conftest import parse_table
 
 if TYPE_CHECKING:
     import respx
+
+    from djen_backup.runner import WorkItem
 
 
 @scenario("../gap_detection.feature", "Detect missing tribunals for a date")
@@ -42,37 +42,12 @@ def test_cache_skip() -> None:
 
 
 @given(
-    parsers.parse('Internet Archive has files for "{date_str}":'),
-    target_fixture="ia_date_str",
-)
-def given_ia_files(
-    mock_api: respx.MockRouter,
-    date_str: str,
-    datatable: list[list[str]],
-) -> str:
-    rows = parse_table(datatable)
-    filenames = [row["filename"] for row in rows]
-    payload = {"files": [{"name": fn} for fn in filenames]}
-    mock_api.get(f"https://archive.org/metadata/djen-{date_str}").respond(200, json=payload)
-    return date_str
-
-
-@given(
     parsers.parse('Internet Archive has no item for "{date_str}"'),
     target_fixture="ia_date_str",
 )
 def given_ia_empty(mock_api: respx.MockRouter, date_str: str) -> str:
     mock_api.get(f"https://archive.org/metadata/djen-{date_str}").respond(200, json={"files": []})
     return date_str
-
-
-@given(
-    "the tribunal list is:",
-    target_fixture="tribunal_list",
-)
-def given_tribunal_list(datatable: list[list[str]]) -> list[str]:
-    rows = parse_table(datatable)
-    return [row["tribunal"] for row in rows]
 
 
 @given(
@@ -86,30 +61,13 @@ def given_state_cache_covered(
 ) -> str:
     d = date.fromisoformat(date_str)
     rows = parse_table(datatable)
-    for row in rows:
-        state.mark(d, row["tribunal"], ItemStatus.UPLOADED)
+
+    async def _mark() -> None:
+        for row in rows:
+            await state.mark(d, row["tribunal"], ItemStatus.UPLOADED)
+
+    asyncio.run(_mark())
     return date_str
-
-
-# ── When ─────────────────────────────────────────────────────────────
-
-
-@when(
-    parsers.parse('I detect gaps for "{date_str}"'),
-    target_fixture="gaps",
-)
-def when_detect_gaps(
-    state: State,
-    tribunal_list: list[str],
-    date_str: str,
-) -> list[WorkItem]:
-    d = date.fromisoformat(date_str)
-
-    async def _run() -> list[WorkItem]:
-        async with httpx.AsyncClient() as client:
-            return await discover_gaps(client, state, tribunal_list, d, d, force_recheck=False)
-
-    return asyncio.run(_run())
 
 
 # ── Then ─────────────────────────────────────────────────────────────
@@ -121,11 +79,6 @@ def then_gaps_are(gaps: list[WorkItem], datatable: list[list[str]]) -> None:
     expected = {row["tribunal"] for row in rows}
     actual = {item.tribunal for item in gaps}
     assert actual == expected, f"Expected gaps {expected}, got {actual}"
-
-
-@then("there should be no gaps")
-def then_no_gaps(gaps: list[WorkItem]) -> None:
-    assert len(gaps) == 0, f"Expected no gaps, got {gaps}"
 
 
 @then("the Internet Archive should not have been queried")

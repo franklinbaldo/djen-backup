@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import tempfile
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import structlog
@@ -60,9 +62,10 @@ async def get_caderno_url(
 async def download_zip(
     client: httpx.AsyncClient,
     url: str,
-) -> bytes:
-    """Download a ZIP file from the given URL.
+) -> Path:
+    """Download a ZIP file to a temporary file and return its path.
 
+    The caller is responsible for cleaning up the temp file.
     Raises :class:`DJENNotFound` for 404 or empty responses.
     """
     resp = await request_with_retry(client, "GET", url)
@@ -75,4 +78,8 @@ async def download_zip(
     if len(resp.content) == 0:
         raise DJENNotFound(status_code=resp.status_code, reason="Empty ZIP response")
 
-    return resp.content
+    with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
+        tmp.write(resp.content)
+
+    log.debug("zip_downloaded_to_file", path=tmp.name, size=len(resp.content))
+    return Path(tmp.name)

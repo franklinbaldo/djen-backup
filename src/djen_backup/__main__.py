@@ -73,7 +73,7 @@ def _parse_date(value: str) -> date:
 @click.option(
     "--workers",
     type=int,
-    default=8,
+    default=1,
     show_default=True,
     help="Parallel workers.",
 )
