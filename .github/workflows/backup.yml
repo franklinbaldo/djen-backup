@@ -1,0 +1,65 @@
+name: DJEN Backup
+
+on:
+  schedule:
+    - cron: '*/20 * * * *'
+  workflow_dispatch:
+    inputs:
+      start_date:
+        description: 'Start date (YYYY-MM-DD)'
+        required: false
+      end_date:
+        description: 'End date (YYYY-MM-DD)'
+        required: false
+      tribunal:
+        description: 'Single tribunal (e.g. TJSP)'
+        required: false
+
+concurrency:
+  group: djen-backup
+  cancel-in-progress: false
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v4
+
+      - name: Restore state cache
+        uses: actions/download-artifact@v4
+        with:
+          name: djen-state
+          path: .cache/
+        continue-on-error: true
+
+      - name: Run backup
+        run: |
+          args=""
+          [ -n "$START_DATE" ] && args="$args --start-date $START_DATE"
+          [ -n "$END_DATE" ] && args="$args --end-date $END_DATE"
+          [ -n "$TRIBUNAL" ] && args="$args --tribunal $TRIBUNAL"
+          uv run djen-backup $args --deadline-minutes 45 --state-file .cache/state.json --backfill-state-file .cache/backfill-state.json
+        env:
+          START_DATE: ${{ inputs.start_date }}
+          END_DATE: ${{ inputs.end_date }}
+          TRIBUNAL: ${{ inputs.tribunal }}
+          IAS3_ACCESS_KEY: ${{ secrets.IA_ACCESS_KEY }}
+          IAS3_SECRET_KEY: ${{ secrets.IA_SECRET_KEY }}
+
+      - name: Save state cache
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: djen-state
+          path: |
+            .cache/state.json
+            .cache/backfill-state.json
+          retention-days: 30
+          overwrite: true
+
+      - name: Report failure
+        if: failure()
+        run: echo "::error::DJEN backup failed — check run logs for details"
