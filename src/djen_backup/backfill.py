@@ -489,15 +489,18 @@ async def run_backfill(config: BackfillConfig) -> int:
             validate_tribunal(config.tribunal)
             all_tribunals = [config.tribunal]
 
-        # 2. Advance stale cursors so new dates are always checked
+        # 2. Advance stopped tribunal cursors so new dates get checked
+        #    Running tribunals keep their cursor to avoid discarding progress.
         for t in all_tribunals:
-            advanced = await bstate.ensure_cursor_at_least(t, config.start_date)
-            if advanced:
-                log.info(
-                    "cursor_auto_advanced",
-                    tribunal=t,
-                    new_cursor=config.start_date.isoformat(),
-                )
+            prog = bstate.get_all_progress().get(t)
+            if prog is not None and prog.stopped:
+                advanced = await bstate.ensure_cursor_at_least(t, config.start_date)
+                if advanced:
+                    log.info(
+                        "cursor_auto_advanced",
+                        tribunal=t,
+                        new_cursor=config.start_date.isoformat(),
+                    )
 
         # 3. Process tribunals
         summary = BackfillSummary()
