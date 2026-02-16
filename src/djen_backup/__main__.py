@@ -12,7 +12,6 @@ import click
 import structlog
 
 from djen_backup.credentials import get_ia_s3_auth
-from djen_backup.runner import RunConfig, run
 
 structlog.configure(
     processors=[
@@ -55,137 +54,24 @@ def _resolve_ia_auth(*, dry_run: bool) -> str:
 # ── CLI group ────────────────────────────────────────────────────────
 
 
-@click.group()
-def main() -> None:
-    """Back up DJEN judicial communications to the Internet Archive."""
-
-
-# ── scan (recent gap-filling, the original default) ──────────────────
-
-
-@main.command()
+@click.group(invoke_without_command=True)
 @click.option(
     "--start-date",
     type=click.STRING,
     default=None,
-    help="Start date (YYYY-MM-DD). Default: 7 days ago.",
+    help="Oldest date to scan (YYYY-MM-DD). Default: no lower bound.",
 )
 @click.option(
     "--end-date",
     type=click.STRING,
     default=None,
-    help="End date (YYYY-MM-DD). Default: yesterday.",
+    help="Newest date to scan (YYYY-MM-DD). Default: yesterday.",
 )
 @click.option(
     "--tribunal",
     type=click.STRING,
     default=None,
     help="Process a single tribunal (e.g. TJSP).",
-)
-@click.option(
-    "--deadline-minutes",
-    type=int,
-    default=45,
-    show_default=True,
-    help="Time budget in minutes.",
-)
-@click.option(
-    "--max-items",
-    type=int,
-    default=0,
-    help="Cap work queue size (0 = unlimited).",
-)
-@click.option(
-    "--workers",
-    type=int,
-    default=1,
-    show_default=True,
-    help="Parallel workers.",
-)
-@click.option(
-    "--state-file",
-    type=click.Path(path_type=Path),
-    default=None,
-    help="Path to persistent state cache JSON.",
-)
-@click.option(
-    "--dry-run",
-    is_flag=True,
-    default=False,
-    help="Log actions without uploading.",
-)
-@click.option(
-    "--force-recheck",
-    is_flag=True,
-    default=False,
-    help="Ignore state cache; re-query IA metadata for all dates.",
-)
-def scan(
-    start_date: str | None,
-    end_date: str | None,
-    tribunal: str | None,
-    deadline_minutes: int,
-    max_items: int,
-    workers: int,
-    state_file: Path | None,
-    dry_run: bool,
-    force_recheck: bool,
-) -> None:
-    """Scan recent dates for gaps and upload missing items."""
-    today = date.today()
-    resolved_end = _parse_date(end_date) if end_date else today - timedelta(days=1)
-    resolved_start = _parse_date(start_date) if start_date else resolved_end - timedelta(days=6)
-
-    config = RunConfig(
-        start_date=resolved_start,
-        end_date=resolved_end,
-        tribunal=tribunal,
-        deadline_minutes=deadline_minutes,
-        max_items=max_items,
-        workers=workers,
-        state_file=state_file,
-        djen_proxy_url=_resolve_proxy_url(),
-        ia_auth=_resolve_ia_auth(dry_run=dry_run),
-        dry_run=dry_run,
-        force_recheck=force_recheck,
-    )
-
-    log = structlog.get_logger()
-    log.info(
-        "starting_scan",
-        start=config.start_date.isoformat(),
-        end=config.end_date.isoformat(),
-        tribunal=config.tribunal or "all",
-        workers=config.workers,
-        deadline_min=config.deadline_minutes,
-        dry_run=config.dry_run,
-    )
-
-    exit_code = asyncio.run(run(config))
-    sys.exit(exit_code)
-
-
-# ── backfill (historical backward scanning) ──────────────────────────
-
-
-@main.command()
-@click.option(
-    "--start-date",
-    type=click.STRING,
-    default=None,
-    help="Newest date to begin backward scan (YYYY-MM-DD). Default: yesterday.",
-)
-@click.option(
-    "--lower-bound",
-    type=click.STRING,
-    required=True,
-    help="Oldest date to scan (YYYY-MM-DD). Required.",
-)
-@click.option(
-    "--tribunal",
-    type=click.STRING,
-    default=None,
-    help="Backfill a single tribunal (e.g. TJSP).",
 )
 @click.option(
     "--deadline-minutes",
@@ -205,7 +91,7 @@ def scan(
     type=int,
     default=1,
     show_default=True,
-    help="Concurrent tribunals to scan.",
+    help="Parallel workers.",
 )
 @click.option(
     "--backfill-state-file",
@@ -217,7 +103,7 @@ def scan(
     "--state-file",
     type=click.Path(path_type=Path),
     default=None,
-    help="Path to IA state cache JSON (shared with scan).",
+    help="Path to IA state cache JSON.",
 )
 @click.option(
     "--dry-run",
@@ -225,9 +111,11 @@ def scan(
     default=False,
     help="Log actions without uploading.",
 )
-def backfill(
+@click.pass_context
+def main(
+    ctx: click.Context,
     start_date: str | None,
-    lower_bound: str,
+    end_date: str | None,
     tribunal: str | None,
     deadline_minutes: int,
     max_items: int,
@@ -236,19 +124,24 @@ def backfill(
     state_file: Path | None,
     dry_run: bool,
 ) -> None:
-    """Scan backward through history per tribunal.
+    """Back up DJEN judicial communications to the Internet Archive.
 
-    Stops scanning a tribunal after 60 consecutive authoritative empty days.
+    Scans backward from --end-date per tribunal, stopping each after
+    60 consecutive authoritative empty days.  Progress is persisted
+    across runs via --backfill-state-file.
     """
+    if ctx.invoked_subcommand is not None:
+        return
+
     from djen_backup.backfill import BackfillConfig, run_backfill
 
     today = date.today()
-    resolved_start = _parse_date(start_date) if start_date else today - timedelta(days=1)
-    resolved_lower = _parse_date(lower_bound)
+    resolved_end = _parse_date(end_date) if end_date else today - timedelta(days=1)
+    resolved_start = _parse_date(start_date) if start_date else None
 
     config = BackfillConfig(
-        start_date=resolved_start,
-        lower_bound=resolved_lower,
+        start_date=resolved_end,
+        lower_bound=resolved_start,
         tribunal=tribunal,
         deadline_minutes=deadline_minutes,
         max_items=max_items,
@@ -261,10 +154,11 @@ def backfill(
     )
 
     log = structlog.get_logger()
+    lower_str = config.lower_bound.isoformat() if config.lower_bound else "none"
     log.info(
-        "starting_backfill",
-        start=config.start_date.isoformat(),
-        lower_bound=config.lower_bound.isoformat(),
+        "starting_backup",
+        end=config.start_date.isoformat(),
+        lower_bound=lower_str,
         tribunal=config.tribunal or "all",
         workers=config.workers,
         deadline_min=config.deadline_minutes,
