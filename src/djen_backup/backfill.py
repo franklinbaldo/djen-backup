@@ -42,6 +42,7 @@ class TribunalProgress:
     cursor_date: date
     empty_streak: int = 0
     stopped: bool = False
+    stop_boundary: date | None = None
     last_hit_date: date | None = None
     last_checked_at: str | None = None
     last_result: str | None = None  # "hit" | "empty" | "error"
@@ -51,6 +52,7 @@ class TribunalProgress:
             "cursor_date": self.cursor_date.isoformat(),
             "empty_streak": self.empty_streak,
             "stopped": self.stopped,
+            "stop_boundary": self.stop_boundary.isoformat() if self.stop_boundary else None,
             "last_hit_date": self.last_hit_date.isoformat() if self.last_hit_date else None,
             "last_checked_at": self.last_checked_at,
             "last_result": self.last_result,
@@ -66,6 +68,13 @@ class TribunalProgress:
         last_hit_raw = data.get("last_hit_date")
         last_hit = date.fromisoformat(last_hit_raw) if isinstance(last_hit_raw, str) else None
 
+        stop_boundary_raw = data.get("stop_boundary")
+        stop_boundary = (
+            date.fromisoformat(stop_boundary_raw)
+            if isinstance(stop_boundary_raw, str)
+            else None
+        )
+
         last_checked = data.get("last_checked_at")
         last_result = data.get("last_result")
 
@@ -76,6 +85,7 @@ class TribunalProgress:
             cursor_date=date.fromisoformat(cursor_raw),
             empty_streak=streak,
             stopped=bool(data.get("stopped", False)),
+            stop_boundary=stop_boundary,
             last_hit_date=last_hit,
             last_checked_at=str(last_checked) if last_checked else None,
             last_result=str(last_result) if last_result else None,
@@ -107,6 +117,7 @@ class BackfillState:
         async with self._lock:
             prog = self._tribunals[tribunal]
             prog.empty_streak = 0
+            prog.stop_boundary = None
             prog.last_hit_date = d
             prog.last_result = "hit"
             prog.last_checked_at = datetime.now(tz=UTC).isoformat()
@@ -146,6 +157,13 @@ class BackfillState:
                 return True
             return False
 
+    async def stop_at_boundary(self, tribunal: str) -> None:
+        """Mark tribunal as stopped because it hit the historical boundary."""
+        async with self._lock:
+            prog = self._tribunals[tribunal]
+            prog.stopped = True
+            prog.stop_boundary = None
+
     async def ensure_cursor_at_least(self, tribunal: str, min_date: date) -> bool:
         """Advance the tribunal's cursor to *min_date* if it is older.
 
@@ -157,10 +175,11 @@ class BackfillState:
                 return False
             prog = self._tribunals[tribunal]
             if prog.cursor_date < min_date:
-                prog.cursor_date = min_date
                 if prog.stopped:
+                    prog.stop_boundary = prog.cursor_date
                     prog.stopped = False
                     prog.empty_streak = 0
+                prog.cursor_date = min_date
                 return True
             return False
 
@@ -427,6 +446,15 @@ async def backfill_tribunal(
             break
 
         current_date = prog.cursor_date
+
+        if prog.stop_boundary and current_date <= prog.stop_boundary:
+            log.info(
+                "backfill_hit_boundary",
+                tribunal=tribunal,
+                boundary=prog.stop_boundary.isoformat(),
+            )
+            await bstate.stop_at_boundary(tribunal)
+            break
 
         log.debug(
             "backfill_date",
